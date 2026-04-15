@@ -53,6 +53,9 @@ sys.path.insert(0, os.path.dirname(__file__) + '/..')
 import argparse
 import json
 import types
+import subprocess
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import cv2
 import numpy as np
 import torch
@@ -64,11 +67,57 @@ from natsort import natsorted
 # ── HOT3D data provider ────────────────────────────────────────────────────────
 _HOT3D_REPO = os.environ.get('HOT3D_REPO_DIR', '/lp-dev/qianqian/hot3d-private/hot3d')
 sys.path.insert(0, _HOT3D_REPO)
-from dataset_api import Hot3dDataProvider                               # noqa: E402
-from data_loaders.loader_object_library import ObjectLibrary            # noqa: E402
+from data_loaders.loader_object_library import ObjectLibrary, load_object_library  # noqa: E402
 from projectaria_tools.core.sensor_data import TimeDomain, TimeQueryOptions  # noqa: E402
 from projectaria_tools.core.calibration import LINEAR                   # noqa: E402
 from projectaria_tools.core.stream_id import StreamId                   # noqa: E402
+
+try:
+    from dataset_api import Hot3dDataProvider  # noqa: E402
+except Exception as _dataset_import_err:
+    # Some environments miss pyvrs/pyvrs2 (Quest-only dependency) even for Aria
+    # sequences. Provide an Aria-only fallback provider for this eval script.
+    from data_loaders.AriaDataProvider import AriaDataProvider  # noqa: E402
+    from data_loaders.PathProvider import Hot3dDataPathProvider  # noqa: E402
+    from data_loaders.headsets import Headset  # noqa: E402
+    from data_loaders.HeadsetPose3dProvider import (  # noqa: E402
+        load_headset_pose_provider_from_csv,
+    )
+
+    class Hot3dDataProvider:  # type: ignore[no-redef]
+        def __init__(self, sequence_folder: str, object_library, mano_hand_model=None, fail_on_missing_data: bool = True):
+            self.path_provider = Hot3dDataPathProvider.fromRecordingFolder(
+                recording_instance_folderpath=sequence_folder
+            )
+            if self.path_provider is None or not self.path_provider.is_valid():
+                if fail_on_missing_data:
+                    raise RuntimeError(f"Invalid HOT3D sequence folder: {sequence_folder}")
+            if self.get_device_type() != Headset.Aria:
+                raise RuntimeError(
+                    f"Aria-only fallback cannot load non-Aria sequence: {sequence_folder}. "
+                    f"Original import error: {_dataset_import_err}"
+                )
+            self._device_data_provider = AriaDataProvider(
+                self.path_provider.vrs_filepath,
+                self.path_provider.mps_folderpath,
+            )
+            self._device_pose_provider = load_headset_pose_provider_from_csv(
+                self.path_provider.headset_trajectory_filepath
+            )
+
+        def get_device_type(self):
+            import json as _json
+            with open(self.path_provider.scene_metadata_filepath, "r") as f:
+                md = _json.load(f)
+            return Headset[md["headset"]]
+
+        @property
+        def device_data_provider(self):
+            return self._device_data_provider
+
+        @property
+        def device_pose_data_provider(self):
+            return self._device_pose_provider
 
 # ── HaWoR pipeline modules ────────────────────────────────────────────────────
 from lib.pipeline.tools import detect_track, parse_chunks_hand_frame   # noqa: E402
@@ -261,6 +310,7 @@ def compute_metrics(joints_pred_aligned: np.ndarray,
                     verts_pred_aligned,
                     pred_valid_np: np.ndarray,
                     gt_frame_paths,
+                    timestamps_ns=None,
                     segment_len: int = TRAJ_SEGMENT_LEN):
     """
     Compute all hand metrics.
@@ -271,29 +321,33 @@ def compute_metrics(joints_pred_aligned: np.ndarray,
     verts_pred_aligned  : (T, 2, 778, 3) or None
     pred_valid_np       : (T, 2) bool
     gt_frame_paths      : list of GT npz paths (one per frame, aligned by index)
-    segment_len         : frames per W/WA-MPJPE segment
+    timestamps_ns       : (T,) int64 or None — frame timestamps; if None assumes 30 fps
+    segment_len         : frames per segment (W/WA-MPJPE, ATE, RTE, Accel)
 
     Returns
     -------
     dict with keys:
-      abs_mpjpe_mm, pa_mpjpe_mm, mpvpe_mm          — per-frame averaged
-      w_mpjpe_mm, wa_mpjpe_mm                       — trajectory-segment metrics
-      wrist_ate_m, wrist_ate_s_m                    — wrist ATE (meters)
-      (all averaged over both hands and all valid frames/segments)
+      pa_mpjpe_mm, mpvpe_mm             — per-frame
+      w_mpjpe_mm, wa_mpjpe_mm           — per-segment Sim3-aligned MPJPE
+      ate_m, ate_s_m                    — per-segment wrist ATE (meters)
+      rte_pct                           — per-segment wrist RTE (%)
+      accel_ms2                         — per-segment acceleration error (m/s²)
+      (all averaged over both hands and all valid segments/frames)
     """
     T = joints_pred_aligned.shape[0]
 
-    # ── per-frame metrics ──────────────────────────────────────────────────────
-    abs_errs, pa_errs, mpvpe_errs = [], [], []
+    # Frame timestamps in seconds (for Accel)
+    if timestamps_ns is not None:
+        ts_sec = np.asarray(timestamps_ns, dtype=np.float64) / 1e9
+    else:
+        ts_sec = np.arange(T, dtype=np.float64) / 30.0   # assume 30 fps
 
-    # Segment metrics: shape (T, 2, 20, 3), nan where invalid
+    # ── per-frame metrics ──────────────────────────────────────────────────────
+    pa_errs, mpvpe_errs = [], []
+
+    # Segment buffers: nan where invalid
     joints_for_seg    = np.full((T, 2, 20, 3), np.nan)
     gt_joints_for_seg = np.full((T, 2, 20, 3), np.nan)
-
-    # Wrist ATE: collect per-side trajectory (nan where invalid)
-    # WRIST_HOT3D_IDX = 5 → HOT3D_TO_MANO[5] = 0 = MANO wrist root
-    wrist_pred_traj = np.full((T, 2, 3), np.nan)
-    wrist_gt_traj   = np.full((T, 2, 3), np.nan)
 
     for t, gt_path in enumerate(gt_frame_paths):
         with np.load(gt_path, allow_pickle=True) as npz:
@@ -312,14 +366,9 @@ def compute_metrics(joints_pred_aligned: np.ndarray,
             pj = joints_pred_aligned[t, side]   # (20, 3)
             gj = gt_j[side]                     # (20, 3)
 
-            abs_errs.append(float(np.linalg.norm(pj - gj, axis=-1).mean() * 1000.0))
             pa_errs.append(_pa_mpjpe_mm(pj, gj))
-
             joints_for_seg[t, side]    = pj
             gt_joints_for_seg[t, side] = gj
-
-            wrist_pred_traj[t, side] = pj[WRIST_HOT3D_IDX]
-            wrist_gt_traj[t, side]   = gj[WRIST_HOT3D_IDX]
 
             if verts_pred_aligned is not None and gt_v is not None:
                 pv = verts_pred_aligned[t, side]
@@ -329,57 +378,78 @@ def compute_metrics(joints_pred_aligned: np.ndarray,
     def _safe_mean(lst):
         return float(np.mean(lst)) if lst else float('nan')
 
-    # ── segment metrics: W-MPJPE and WA-MPJPE ─────────────────────────────────
+    # ── per-segment metrics ────────────────────────────────────────────────────
     w_errs, wa_errs = [], []
+    ate_vals, ate_s_vals = [], []
+    rte_vals = []
+    accel_vals = []
+
     for seg_start in range(0, T, segment_len):
-        seg_end = min(seg_start + segment_len, T)
+        seg_end  = min(seg_start + segment_len, T)
+        seg_ts   = ts_sec[seg_start:seg_end]
+
         for side in range(2):
-            seg_pred = joints_for_seg[seg_start:seg_end, side]   # (S, 20, 3)
+            seg_pred = joints_for_seg[seg_start:seg_end, side]     # (S, 20, 3)
             seg_gt   = gt_joints_for_seg[seg_start:seg_end, side]
 
-            # keep only frames valid in both pred and gt
-            valid_mask = ~(np.isnan(seg_pred).any(axis=(-1,-2)) |
-                           np.isnan(seg_gt).any(axis=(-1,-2)))
+            valid_mask = ~(np.isnan(seg_pred).any(axis=(-1, -2)) |
+                           np.isnan(seg_gt).any(axis=(-1, -2)))
             if valid_mask.sum() < 4:
                 continue
 
-            vp = seg_pred[valid_mask]   # (V, 20, 3)
-            vg = seg_gt[valid_mask]
+            vp  = seg_pred[valid_mask]    # (V, 20, 3)
+            vg  = seg_gt[valid_mask]
+            vts = seg_ts[valid_mask]      # (V,)
 
-            # W-MPJPE: Sim3 estimated from first 2 valid frames
+            # W-MPJPE: Sim3 from first 2 valid frames
             anchor = min(2, vp.shape[0])
-            s, R, t = _procrustes_transform(
-                vp[:anchor].reshape(-1, 3),
-                vg[:anchor].reshape(-1, 3))
-            aligned_w = _apply_sim3(vp, s, R, t)
+            s, R, t_sim = _procrustes_transform(
+                vp[:anchor].reshape(-1, 3), vg[:anchor].reshape(-1, 3))
+            aligned_w = _apply_sim3(vp, s, R, t_sim)
             w_errs.append(float(np.linalg.norm(aligned_w - vg, axis=-1).mean() * 1000.0))
 
-            # WA-MPJPE: Sim3 estimated from whole segment
-            s, R, t = _procrustes_transform(vp.reshape(-1, 3), vg.reshape(-1, 3))
-            aligned_wa = _apply_sim3(vp, s, R, t)
+            # WA-MPJPE: Sim3 from whole segment
+            s, R, t_sim = _procrustes_transform(vp.reshape(-1, 3), vg.reshape(-1, 3))
+            aligned_wa = _apply_sim3(vp, s, R, t_sim)
             wa_errs.append(float(np.linalg.norm(aligned_wa - vg, axis=-1).mean() * 1000.0))
 
-    # ── wrist ATE: per-side, then average ─────────────────────────────────────
-    ate_vals, ate_s_vals = [], []
-    for side in range(2):
-        valid_mask = ~np.isnan(wrist_pred_traj[:, side, 0])
-        if valid_mask.sum() < 4:
-            continue
-        vp = wrist_pred_traj[valid_mask, side]   # (N, 3)
-        vg = wrist_gt_traj[valid_mask, side]
-        ate_m, ate_s_m = _compute_ate(vp, vg)
-        ate_vals.append(ate_m)
-        ate_s_vals.append(ate_s_m)
+            # Wrist positions for ATE / RTE
+            wp = vp[:, WRIST_HOT3D_IDX]   # (V, 3)
+            wg = vg[:, WRIST_HOT3D_IDX]
+
+            # ATE (Sim3) and ATE-S (SE3) — per segment
+            ate_m, ate_s_m = _compute_ate(wp, wg)
+            ate_vals.append(ate_m)
+            ate_s_vals.append(ate_s_m)
+
+            # RTE: rigid-align wrist traj, mean error / GT displacement * 100%
+            R_rte, t_rte = align_se3_traj(wp, wg)
+            wp_aligned   = (R_rte @ wp.T).T + t_rte
+            mean_err_rte = float(np.linalg.norm(wp_aligned - wg, axis=-1).mean())
+            gt_disp      = float(np.linalg.norm(np.diff(wg, axis=0), axis=-1).sum())
+            if gt_disp > 1e-6:
+                rte_vals.append(mean_err_rte / gt_disp * 100.0)
+
+            # Accel: second-derivative of mean joint position (m/s²)
+            if vp.shape[0] >= 3:
+                pp = vp.mean(axis=1)   # (V, 3) — mean over 20 joints
+                gp = vg.mean(axis=1)
+                dt = float(np.mean(np.diff(vts))) if len(vts) > 1 else 1.0 / 30.0
+                pred_accel = (pp[2:] - 2 * pp[1:-1] + pp[:-2]) / (dt ** 2)   # (V-2, 3)
+                gt_accel   = (gp[2:] - 2 * gp[1:-1] + gp[:-2]) / (dt ** 2)
+                accel_err  = np.linalg.norm(pred_accel - gt_accel, axis=-1)   # (V-2,) m/s²
+                accel_vals.extend(accel_err.tolist())
 
     return {
-        'abs_mpjpe_mm':   _safe_mean(abs_errs),
         'pa_mpjpe_mm':    _safe_mean(pa_errs),
         'mpvpe_mm':       _safe_mean(mpvpe_errs),
         'w_mpjpe_mm':     _safe_mean(w_errs),
         'wa_mpjpe_mm':    _safe_mean(wa_errs),
-        'wrist_ate_m':    _safe_mean(ate_vals),
-        'wrist_ate_s_m':  _safe_mean(ate_s_vals),
-        'n_valid_frames': len(abs_errs),
+        'ate_m':          _safe_mean(ate_vals),
+        'ate_s_m':        _safe_mean(ate_s_vals),
+        'rte_pct':        _safe_mean(rte_vals),
+        'accel_ms2':      _safe_mean(accel_vals),
+        'n_valid_frames': len(pa_errs),
     }
 
 
@@ -431,6 +501,7 @@ def run_sequence(args, sequence_name: str, sequence_folder: str):
 
     seq_folder = os.path.join(args.out_dir, sequence_name)
     os.makedirs(seq_folder, exist_ok=True)
+    img_folder = os.path.join(seq_folder, 'extracted_images')
 
     # fake video_path so hawor_* functions derive the correct seq_folder
     fake_video_path = os.path.join(args.out_dir, f'{sequence_name}.mp4')
@@ -438,7 +509,20 @@ def run_sequence(args, sequence_name: str, sequence_folder: str):
     use_cuda = torch.cuda.is_available()
 
     # ── load HOT3D data provider ───────────────────────────────────────────────
-    object_library = ObjectLibrary.from_folder(args.object_library_folder)
+    # HOT3D API differs by version: newer code exposes load_object_library()
+    # while some forks may provide ObjectLibrary.from_folder().
+    # Some server datasets miss object_library/instance.json entirely. For this
+    # eval path we only need Aria image/pose providers, so allow an empty
+    # object library fallback instead of hard-failing.
+    instance_json = os.path.join(args.object_library_folder, "instance.json")
+    if os.path.isfile(instance_json):
+        if hasattr(ObjectLibrary, "from_folder"):
+            object_library = ObjectLibrary.from_folder(args.object_library_folder)
+        else:
+            object_library = load_object_library(args.object_library_folder)
+    else:
+        print(f"[WARN] instance.json not found under {args.object_library_folder}; using empty object library fallback")
+        object_library = ObjectLibrary({}, args.object_library_folder)
     hot3d_dp = Hot3dDataProvider(
         sequence_folder=sequence_folder,
         object_library=object_library,
@@ -446,7 +530,6 @@ def run_sequence(args, sequence_name: str, sequence_folder: str):
     )
 
     # ── Step 1: extract frames ─────────────────────────────────────────────────
-    img_folder = os.path.join(seq_folder, 'extracted_images')
     meta_path  = os.path.join(seq_folder, 'vrs_meta.npz')
 
     if not args.skip_inference and (
@@ -573,7 +656,14 @@ def run_sequence(args, sequence_name: str, sequence_folder: str):
     verts_aligned  = (R_f @ verts_slam.reshape(-1, 3).T).T.reshape(
         n_frames, 2, 778, 3) + t_f
 
-    pred_valid_np = (pred_valid.numpy() > 0.5).T  # (T, 2)
+    # joblib may load pred_valid as Tensor or ndarray depending on save path
+    if torch.is_tensor(pred_valid):
+        pv = pred_valid.detach().cpu().float().numpy()
+    else:
+        pv = np.asarray(pred_valid, dtype=np.float32)
+    if pv.ndim != 2 or 2 not in pv.shape:
+        raise ValueError(f'pred_valid expected shape (*, 2) or (2, *), got {pv.shape}')
+    pred_valid_np = (pv > 0.5).T if pv.shape[0] == 2 else (pv > 0.5)  # (T, 2)
 
     # ── Step 8: load GT frames and compute metrics ────────────────────────────
     seq_gt_dir = os.path.join(args.gt_root, sequence_name)
@@ -607,7 +697,13 @@ def run_sequence(args, sequence_name: str, sequence_folder: str):
         verts_aligned[matched_pred_idx],
         pred_valid_np[matched_pred_idx],
         matched_gt_paths,
+        timestamps_ns=timestamps_ns[matched_pred_idx],
     )
+    if args.cleanup_extracted_images:
+        shutil.rmtree(img_folder, ignore_errors=True)
+        metrics['cleaned_extracted_images'] = True
+    else:
+        metrics['cleaned_extracted_images'] = False
     metrics['sequence'] = sequence_name
     return metrics
 
@@ -617,13 +713,51 @@ def run_sequence(args, sequence_name: str, sequence_folder: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def aggregate(rows):
-    float_keys = ['abs_mpjpe_mm', 'pa_mpjpe_mm', 'mpvpe_mm',
+    float_keys = ['pa_mpjpe_mm', 'mpvpe_mm',
                   'w_mpjpe_mm', 'wa_mpjpe_mm',
-                  'wrist_ate_m', 'wrist_ate_s_m']
+                  'ate_m', 'ate_s_m',
+                  'rte_pct', 'accel_ms2']
     out = {k: float(np.nanmean([r[k] for r in rows])) for k in float_keys}
     out['n_sequences'] = len(rows)
     out['n_valid_frames_total'] = sum(r['n_valid_frames'] for r in rows)
     return out
+
+
+def _parse_gpu_ids(gpu_ids: str):
+    ids = [x.strip() for x in str(gpu_ids).split(',') if x.strip() != ""]
+    return ids or ["0"]
+
+
+def _run_sequence_subprocess(args, sequence_name: str, sequence_folder: str, gpu_id: str, per_seq_out_dir: str):
+    script_path = os.path.abspath(__file__)
+    cmd = [
+        sys.executable, script_path,
+        '--checkpoint', args.checkpoint,
+        '--infiller_weight', args.infiller_weight,
+        '--gt_root', args.gt_root,
+        '--out_dir', per_seq_out_dir,
+        '--object_library_folder', args.object_library_folder,
+        '--sequence_name', sequence_name,
+        '--sequence_folder', sequence_folder,
+    ]
+    if args.skip_inference:
+        cmd.append('--skip_inference')
+    if args.cpu:
+        cmd.append('--cpu')
+
+    env = os.environ.copy()
+    if not args.cpu:
+        env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+
+    ret = subprocess.run(cmd, env=env)
+    metrics_path = os.path.join(per_seq_out_dir, f'{sequence_name}_metrics.json')
+    if ret.returncode != 0:
+        return sequence_name, None, f'worker failed with return code {ret.returncode}'
+    if not os.path.isfile(metrics_path):
+        return sequence_name, None, f'metrics file not found: {metrics_path}'
+    with open(metrics_path, 'r') as f:
+        metrics = json.load(f)
+    return sequence_name, metrics, None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -655,13 +789,21 @@ def parse_args():
     p.add_argument('--skip_inference', action='store_true',
                    help='Skip steps 1-5 (VRS extract, detect, SLAM, HAWOR); '
                         'requires world_space_res.pth + vrs_meta.npz to exist')
+    p.add_argument('--cleanup_extracted_images', action='store_true',
+                   help='Delete per-sequence extracted_images/ after metrics are computed')
     p.add_argument('--cpu', action='store_true', help='Force CPU (slow)')
+    p.add_argument('--gpu_ids', default='0',
+                   help='Comma-separated visible GPU IDs for all_sequences mode, e.g. "0,1,2,3"')
+    p.add_argument('--num_parallel', type=int, default=1,
+                   help='Max number of sequences to run in parallel for all_sequences mode')
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
+    if args.num_parallel < 1:
+        raise ValueError('--num_parallel must be >= 1')
 
     if args.sequence_name:
         if not args.sequence_folder:
@@ -681,23 +823,61 @@ def main():
         if os.path.isdir(os.path.join(args.gt_root, d)))
 
     all_rows = []
+    valid_tasks = []
     for seq_name in sequence_names:
         seq_folder = os.path.join(args.sequence_root, seq_name)
         if not os.path.isdir(seq_folder):
             print(f'[SKIP] {seq_name}: folder not found at {seq_folder}')
             continue
-        try:
-            m = run_sequence(args, seq_name, seq_folder)
-            all_rows.append(m)
-            print(f'[OK] {seq_name}: abs={m["abs_mpjpe_mm"]:.1f}  '
-                  f'pa={m["pa_mpjpe_mm"]:.1f}  '
-                  f'W={m["w_mpjpe_mm"]:.1f}  '
-                  f'WA={m["wa_mpjpe_mm"]:.1f}  mm  '
-                  f'ATE={m["wrist_ate_m"]*100:.1f}  '
-                  f'ATE-S={m["wrist_ate_s_m"]*100:.1f}  cm')
-        except Exception as e:
-            print(f'[ERROR] {seq_name}: {e}')
+        valid_tasks.append((seq_name, seq_folder))
 
+    gpu_ids = _parse_gpu_ids(args.gpu_ids)
+    per_seq_out_dir = os.path.join(args.out_dir, 'per_sequence')
+    os.makedirs(per_seq_out_dir, exist_ok=True)
+
+    if args.num_parallel == 1:
+        for seq_name, seq_folder in valid_tasks:
+            try:
+                m = run_sequence(args, seq_name, seq_folder)
+                all_rows.append(m)
+                print(f'[OK] {seq_name}: '
+                      f'PA={m["pa_mpjpe_mm"]:.1f}  '
+                      f'W={m["w_mpjpe_mm"]:.1f}  '
+                      f'WA={m["wa_mpjpe_mm"]:.1f}  mm  '
+                      f'ATE={m["ate_m"]*100:.1f}  '
+                      f'ATE-S={m["ate_s_m"]*100:.1f}  cm  '
+                      f'RTE={m["rte_pct"]:.2f}%  '
+                      f'Accel={m["accel_ms2"]:.3f} m/s²')
+            except Exception as e:
+                print(f'[ERROR] {seq_name}: {e}')
+    else:
+        n_workers = min(args.num_parallel, len(valid_tasks))
+        print(f'[all_sequences] Parallel mode: workers={n_workers}, gpu_ids={gpu_ids}')
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            futures = []
+            for idx, (seq_name, seq_folder) in enumerate(valid_tasks):
+                gpu_id = gpu_ids[idx % len(gpu_ids)]
+                futures.append(
+                    ex.submit(_run_sequence_subprocess, args, seq_name, seq_folder, gpu_id, per_seq_out_dir)
+                )
+
+            for fut in as_completed(futures):
+                seq_name, m, err = fut.result()
+                if err is not None:
+                    print(f'[ERROR] {seq_name}: {err}')
+                    continue
+                all_rows.append(m)
+                print(f'[OK] {seq_name}: '
+                      f'PA={m["pa_mpjpe_mm"]:.1f}  '
+                      f'W={m["w_mpjpe_mm"]:.1f}  '
+                      f'WA={m["wa_mpjpe_mm"]:.1f}  mm  '
+                      f'ATE={m["ate_m"]*100:.1f}  '
+                      f'ATE-S={m["ate_s_m"]*100:.1f}  cm  '
+                      f'RTE={m["rte_pct"]:.2f}%  '
+                      f'Accel={m["accel_ms2"]:.3f} m/s²')
+
+    if not all_rows:
+        raise RuntimeError('No sequence metrics collected; all runs failed or were skipped.')
     overall = aggregate(all_rows)
     print('\n[OVERALL]', json.dumps(overall, indent=2))
     with open(os.path.join(args.out_dir, 'all_sequences_metrics.json'), 'w') as f:

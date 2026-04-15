@@ -42,9 +42,20 @@ pip install lightning-utilities torchmetrics==1.4.0
 
 ### Install masked DROID-SLAM:
 
+Build **lietorch** and **droid_backends** separately (the upstream `setup.py` used to call `setup()` twice, which breaks `pip install -e`).
+
 ```
-cd thirdparty/DROID-SLAM
+cd thirdparty/DROID-SLAM/thirdparty/lietorch
 python setup.py install
+cd ..
+python setup.py install
+```
+
+Or with pip:
+
+```
+pip install -e thirdparty/DROID-SLAM/thirdparty/lietorch --no-build-isolation
+pip install -e thirdparty/DROID-SLAM --no-build-isolation
 ```
 
 Download DROID-SLAM official weights [droid.pth](https://drive.google.com/file/d/1PpqVt1H4maBa_GbPJp4NwxRsd9jk-elh/view?usp=sharing), put it under `./weights/external/`.

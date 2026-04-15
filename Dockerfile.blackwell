@@ -89,7 +89,9 @@ RUN pip install --no-cache-dir --no-build-isolation \
 
 COPY . .
 
-RUN export MAX_JOBS=1 VERBOSE=1 && cd thirdparty/DROID-SLAM && python setup.py build_ext --verbose install
+RUN export MAX_JOBS=1 VERBOSE=1 && \
+    cd thirdparty/DROID-SLAM/thirdparty/lietorch && python setup.py build_ext --verbose install && \
+    cd .. && cd .. && python setup.py build_ext --verbose install
 
 RUN mkdir -p \
         weights/external \
