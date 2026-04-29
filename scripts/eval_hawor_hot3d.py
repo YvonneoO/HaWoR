@@ -161,7 +161,7 @@ def extract_frames_from_vrs(hot3d_dp: Hot3dDataProvider, stream_id: StreamId,
     timestamps = np.array(device_dp.get_sequence_timestamps(
         stream_id, TimeDomain.TIME_CODE), dtype=np.int64)
 
-    # Pinhole calibration — T_device_cam from native FISHEYE624, intrinsics pinhole
+    # ? use online calibration ?
     T_device_cam_se3, calib = device_dp.get_camera_calibration(stream_id, camera_model=LINEAR)
     focal = float(calib.get_focal_lengths()[0])
     W, H = calib.get_image_size()

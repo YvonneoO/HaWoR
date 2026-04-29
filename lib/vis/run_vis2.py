@@ -142,7 +142,16 @@ def run_vis2_on_video(res_dict, res_dict2, output_pth, focal_length, image_names
         viewer.render_seq(batch, out_folder=os.path.join(output_pth, 'aitviewer'))
         return os.path.join(output_pth, 'aitviewer', "video_0.mp4")
 
-def run_vis2_on_video_cam(res_dict, res_dict2, output_pth, focal_length, image_names, R_w2c=None, t_w2c=None):
+def run_vis2_on_video_cam(
+    res_dict,
+    res_dict2,
+    output_pth,
+    focal_length,
+    image_names,
+    R_w2c=None,
+    t_w2c=None,
+    interactive=True,
+):
     
     img0 = cv2.imread(image_names[0])
     height, width, _ = img0.shape
@@ -210,8 +219,19 @@ def run_vis2_on_video_cam(res_dict, res_dict2, output_pth, focal_length, image_n
     data = viewer_utils.ViewerData(Rt, K, cols, rows, imgnames=image_names)
     batch = (meshes, data)
 
-    viewer = viewer_utils.ARCTICViewer(interactive=True, size=(vis_w, vis_h))
-    viewer.render_seq(batch, out_folder=os.path.join(output_pth, 'aitviewer'))
+    if interactive:
+        viewer = viewer_utils.ARCTICViewer(interactive=True, size=(vis_w, vis_h))
+        viewer.render_seq(batch, out_folder=os.path.join(output_pth, "aitviewer"))
+        return None
+    viewer = viewer_utils.ARCTICViewer(
+        interactive=False, size=(vis_w, vis_h), render_types=["video"]
+    )
+    out_vis = os.path.join(output_pth, "aitviewer")
+    vid_path = os.path.join(out_vis, "video_0.mp4")
+    if os.path.exists(vid_path):
+        os.remove(vid_path)
+    viewer.render_seq(batch, out_folder=out_vis)
+    return vid_path
 
 def lookat_matrix(source_pos, target_pos, up):
     """
