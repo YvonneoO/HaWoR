@@ -3,7 +3,7 @@ set -euo pipefail
 
 # run_docker.sh — build and run the HaWoR container
 # Paths (override via env vars if needed):
-#   HF_CACHE_DIR, MANO_ROOT, WEIGHTS_DIR, METRIC3D_DIR
+#   HF_CACHE_DIR, HOT3D_REPO_DIR, MANO_ROOT, WEIGHTS_DIR, METRIC3D_DIR
 #   HOT3D_DATASET_DIR, HOT3D_GT_ROOT, HOT3D_SPLIT_SUMMARY
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,10 +13,10 @@ DOCKERFILE="${DOCKERFILE:-}"
 DOCKER_GPUS="${DOCKER_GPUS:-all}"
 
 HF_CACHE_DIR="${HF_CACHE_DIR:-${HOME}/.cache/huggingface}"
-MANO_ROOT="${MANO_ROOT:-${MANO_DIR:-/lp-dev/qianqian/mano_v1_2}}"
+HOT3D_REPO_DIR="${HOT3D_REPO_DIR:-/lp-dev/qianqian/hot3d-private}"
+MANO_ROOT="${MANO_ROOT:-${HOT3D_REPO_DIR}/hot3d/dataset/mano_v1_2/models}"
 WEIGHTS_DIR="${WEIGHTS_DIR:-${REPO_DIR}/weights}"
 METRIC3D_DIR="${METRIC3D_DIR:-${REPO_DIR}/thirdparty/Metric3D/weights}"
-HOT3D_REPO_DIR="${HOT3D_REPO_DIR:-/lp-dev/qianqian/hot3d-private}"
 HOT3D_DATASET_DIR="${HOT3D_DATASET_DIR:-/lp-dev/qianqian/hot3d-private/hot3d/dataset}"
 HOT3D_GT_ROOT="${HOT3D_GT_ROOT:-/lp-dev/qianqian/hot3d_gt}"
 HOT3D_SPLIT_SUMMARY="${HOT3D_SPLIT_SUMMARY:-${HOT3D_GT_ROOT}/split_summary.json}"
@@ -57,10 +57,19 @@ fi
 
 mkdir -p "$HF_CACHE_DIR" "$WEIGHTS_DIR" "$METRIC3D_DIR"
 
-if [[ ! -d "${MANO_ROOT}/models" ]]; then
-    echo "[run_docker] Expected MANO models directory not found: ${MANO_ROOT}/models" >&2
+# Directory to bind-mount as container .../_DATA/data/mano (must contain MANO_RIGHT.pkl).
+MANO_MOUNT_DIR=""
+if [[ -f "${MANO_ROOT}/MANO_RIGHT.pkl" ]]; then
+    MANO_MOUNT_DIR="${MANO_ROOT}"
+elif [[ -f "${MANO_ROOT}/models/MANO_RIGHT.pkl" ]]; then
+    MANO_MOUNT_DIR="${MANO_ROOT}/models"
+else
+    echo "[run_docker] MANO_RIGHT.pkl not found under MANO_ROOT=${MANO_ROOT}" >&2
+    echo "[run_docker] Expected either ${MANO_ROOT}/MANO_RIGHT.pkl or ${MANO_ROOT}/models/MANO_RIGHT.pkl" >&2
+    echo "[run_docker] Hint: export MANO_ROOT=/path/to/dir/with/MANO_RIGHT.pkl" >&2
     exit 1
 fi
+echo "[run_docker] MANO bind-mount source: ${MANO_MOUNT_DIR}"
 
 if [[ ! -d "${HOT3D_DATASET_DIR}" ]]; then
     echo "[run_docker] HOT3D dataset dir not found: ${HOT3D_DATASET_DIR}" >&2
@@ -92,16 +101,14 @@ docker run --rm -it \
     -e HOT3D_DATASET_DIR=/data/hot3d_dataset \
     -e HOT3D_GT_ROOT=/data/hot3d_gt \
     -e HOT3D_SPLIT_SUMMARY=/data/hot3d_gt/split_summary.json \
-    -e STAGE1_DIR="${STAGE1_DIR}" \
-    -v "${REPO_DIR}:/workspace/HaWoR" \
-    -v "${HF_CACHE_DIR}:/root/.cache/huggingface" \
-    -v "${WEIGHTS_DIR}:/workspace/HaWoR/weights" \
-    -v "${METRIC3D_DIR}:/workspace/HaWoR/thirdparty/Metric3D/weights" \
-    -v "${MANO_ROOT}/models:/workspace/HaWoR/_DATA/data/mano:ro" \
-    -v "${MANO_ROOT}/models:/workspace/HaWoR/_DATA/data_left/mano_left:ro" \
-    -v "${HOT3D_REPO_DIR}:${HOT3D_REPO_DIR}:ro" \
-    -v "${HOT3D_DATASET_DIR}:/data/hot3d_dataset:ro" \
-    -v "${HOT3D_GT_ROOT}:/data/hot3d_gt:ro" \
-    -v "${STAGE1_DIR}:${STAGE1_DIR}" \
+    -v "${REPO_DIR}:/workspace/HaWoR:rw" \
+    -v "${HF_CACHE_DIR}:/root/.cache/huggingface:rw" \
+    -v "${WEIGHTS_DIR}:/workspace/HaWoR/weights:rw" \
+    -v "${METRIC3D_DIR}:/workspace/HaWoR/thirdparty/Metric3D/weights:rw" \
+    -v "${MANO_MOUNT_DIR}:/workspace/HaWoR/_DATA/data/mano:rw" \
+    -v "${MANO_MOUNT_DIR}:/workspace/HaWoR/_DATA/data_left/mano_left:rw" \
+    -v "${HOT3D_REPO_DIR}:/workspace/hot3d-private:rw" \
+    -v "${HOT3D_DATASET_DIR}:/data/hot3d_dataset:rw" \
+    -v "${HOT3D_GT_ROOT}:/data/hot3d_gt:rw" \
     "$IMAGE_NAME" \
     /bin/bash

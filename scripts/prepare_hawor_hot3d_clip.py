@@ -72,7 +72,15 @@ def _load_pinhole_rgb_and_fx(
 ) -> Tuple[Any, float]:
     import imageio.v2 as imageio
     import cv2
-    from hand_tracking_toolkit.dataset import warp_image
+
+    try:
+        from hand_tracking_toolkit.dataset import warp_image
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            "hand_tracking_toolkit is required for fisheye→pinhole warp (same as HOT3D vis_clips). "
+            "Install: pip install 'git+https://github.com/facebookresearch/hand_tracking_toolkit.git' "
+            "or set HAND_TRACKING_TOOLKIT_PATH to a clone of that repo."
+        ) from e
 
     import clip_util  # noqa: E402  — after _ensure_clip_util
 
@@ -143,10 +151,20 @@ def main() -> None:
 
     import cv2
 
+    try:
+        from tqdm import tqdm
+    except ImportError:
+
+        def tqdm(it, **_kwargs):
+            return it
+
+    n = len(frame_ids)
+    print(f"Undistorting {n} frames (fisheye→pinhole); full Aria res can take several minutes.", flush=True)
+
     map_records = []
     focal_ref: Optional[float] = None
 
-    for i, fid in enumerate(frame_ids):
+    for i, fid in enumerate(tqdm(frame_ids, desc="prepare/warp", unit="frame")):
         out_jpg = os.path.join(img_out, f"{i:06d}.jpg")
         if os.path.isfile(out_jpg) and not args.overwrite:
             # Still read focal from first frame if missing est_focal

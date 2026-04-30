@@ -53,6 +53,11 @@ args = parser.parse_args([])
 args.stereo = False
 args.upsample = True
 args.disable_vis = True
+# Cap GPU memory for short clips: default DROID buffer=512 pre-allocates a large
+# DepthVideo on CUDA. Override e.g. ``export HAWOR_DROID_BUFFER=192`` (>= num frames).
+_dbuf = os.environ.get("HAWOR_DROID_BUFFER", "").strip()
+if _dbuf:
+    args.buffer = max(32, int(_dbuf))
 torch.multiprocessing.set_start_method('spawn')
 
 

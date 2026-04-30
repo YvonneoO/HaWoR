@@ -1,23 +1,8 @@
 #!/usr/bin/env python3
 """
-HaWoR on HOT3D-Clips (untarred folder): prepare pinhole frames → detect/track → SLAM →
-motion → infiller, then align SLAM→GT world using per-frame camera centers from clip GT
-npz, compute the same metrics as ``eval_hawor_hot3d.py``, and optionally export a camera-view mp4.
-
-Run from HaWoR repo root (so ``./weights/...`` and imports resolve), e.g.:
-
-  python scripts/eval_hawor_hot3d_clip.py \\
-    --clip-dir example/clip/clip-001881 \\
-    --gt-seq-dir /data/hot3d-clip/clip_gt/train/clip-001881 \\
-    --hawor-work-root example/hawor_work \\
-    --seq-name clip-001881 \\
-    --hot3d-module-path /workspace/hot3d-private/hot3d \\
-    --checkpoint ./weights/hawor/checkpoints/hawor.ckpt \\
-    --infiller-weight ./weights/hawor/checkpoints/infiller.pt \\
-    --out-dir example/hawor_out/clip-001881 \\
-    --export-video
-
-Requires: same deps as ``demo.py`` / ``eval_hawor_hot3d.py`` (YOLO detector, DROID-SLAM, etc.).
+HOT3D clip: prepare → HaWoR → metrics (``eval_hawor_hot3d``-aligned). Optional ``--export-video``
+(mesh_pyrender + ffmpeg or ``--export-video-renderer cv2``). Repo root; prepare needs
+``hand_tracking_toolkit`` (see HOT3D vis_clips). Optional ``HAWOR_DROID_BUFFER`` for VRAM.
 """
 
 from __future__ import annotations
@@ -37,6 +22,36 @@ import joblib
 import numpy as np
 import torch
 from natsort import natsorted
+
+
+def _write_pinhole_frames_mp4(image_paths: list[str], out_mp4: str, fps: float = 30.0) -> None:
+    """Write one mp4 from undistorted pinhole jpgs using OpenCV only (no OpenGL / aitviewer)."""
+    if not image_paths:
+        raise ValueError("no image paths for mp4 export")
+    first = cv2.imread(image_paths[0])
+    if first is None:
+        raise RuntimeError(f"cv2.imread failed: {image_paths[0]}")
+    h, w = first.shape[:2]
+    out_mp4 = os.path.abspath(out_mp4)
+    parent = os.path.dirname(out_mp4)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(out_mp4, fourcc, float(fps), (w, h))
+    if not writer.isOpened():
+        raise RuntimeError(
+            f"OpenCV VideoWriter could not open {out_mp4} (codec mp4v). "
+            "Check OpenCV was built with ffmpeg/GStreamer, or re-encode frames with ffmpeg."
+        )
+    writer.write(first)
+    for p in image_paths[1:]:
+        im = cv2.imread(p)
+        if im is None:
+            raise RuntimeError(f"cv2.imread failed: {p}")
+        if im.shape[0] != h or im.shape[1] != w:
+            im = cv2.resize(im, (w, h), interpolation=cv2.INTER_AREA)
+        writer.write(im)
+    writer.release()
 
 
 def _repo_root() -> str:
@@ -120,6 +135,7 @@ def _run_prepare(
     stream_id: str,
     hot3d_module_path: Optional[str],
     overwrite: bool,
+    max_frames: Optional[int] = None,
 ):
     prep = os.path.join(_repo_root(), "scripts", "prepare_hawor_hot3d_clip.py")
     cmd = [
@@ -138,7 +154,14 @@ def _run_prepare(
         cmd.append("--overwrite")
     if hot3d_module_path:
         cmd += ["--hot3d-module-path", os.path.abspath(hot3d_module_path)]
-    subprocess.run(cmd, check=True)
+    if max_frames is not None:
+        cmd += ["--max-frames", str(int(max_frames))]
+    env = os.environ.copy()
+    htt = os.environ.get("HAND_TRACKING_TOOLKIT_PATH", "").strip()
+    if htt:
+        prev = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = htt if not prev else f"{htt}{os.pathsep}{prev}"
+    subprocess.run(cmd, check=True, env=env)
 
 
 def parse_args():
@@ -163,13 +186,41 @@ def parse_args():
         action="store_true",
         help="Skip detect/SLAM/HaWoR; requires world_space_res.pth + SLAM npz + vrs_meta.npz under seq folder.",
     )
-    p.add_argument("--export-video", action="store_true", help="Export camera-view mp4 via ARCTICViewer (headless).")
     p.add_argument(
-        "--vis-interactive",
+        "--export-video",
         action="store_true",
-        help="If set with --export-video, open interactive viewer instead of writing mp4.",
+        help="Write *_hawor_cam.mp4 (see --export-video-renderer).",
+    )
+    p.add_argument(
+        "--export-video-renderer",
+        choices=("mesh_pyrender", "cv2"),
+        default="mesh_pyrender",
+        help="mesh_pyrender: undistort RGB + pyrender MANO, then ffmpeg. cv2: jpg→mp4 only.",
+    )
+    p.add_argument(
+        "--export-video-fps",
+        type=float,
+        default=30.0,
+        help="Output video fps (mesh path uses ffmpeg; cv2 path uses OpenCV writer).",
+    )
+    p.add_argument(
+        "--export-video-mesh-alpha",
+        type=float,
+        default=0.75,
+        help="Alpha blend for mesh overlay when --export-video-renderer is mesh_pyrender.",
+    )
+    p.add_argument(
+        "--export-video-keep-frames",
+        action="store_true",
+        help="Keep temporary PNG sequence when using mesh_pyrender (for debugging).",
     )
     p.add_argument("--thresh", type=float, default=0.2, help="Hand detector threshold for detect_track.")
+    p.add_argument(
+        "--max-frames",
+        type=int,
+        default=None,
+        help="Cap frames for prepare + downstream HaWoR (smoke test; default = full clip).",
+    )
     return p.parse_args()
 
 
@@ -178,16 +229,14 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     sys.path.insert(0, _repo_root())
 
-    ev = _load_eval_hot3d_module()
-    load_gt_frame_map = ev.load_gt_frame_map
-    compute_metrics = ev.compute_metrics
-    align_se3_traj = ev.align_se3_traj
-    HOT3D_TO_MANO = ev.HOT3D_TO_MANO
-
-    from hawor.utils.process import get_mano_faces, run_mano, run_mano_left
-    from lib.eval_utils.custom_utils import load_slam_cam
-    from lib.pipeline.tools import detect_track
-    from lib.vis.run_vis2 import run_vis2_on_video_cam
+    # eval_hawor_hot3d.py imports HOT3D from HOT3D_REPO_DIR (see its module top); align with --hot3d-module-path.
+    _hot3d_pkg = (
+        args.hot3d_module_path
+        or os.environ.get("HOT3D_MODULE_PATH")
+        or os.environ.get("HOT3D_REPO_DIR")
+    )
+    if _hot3d_pkg:
+        os.environ["HOT3D_REPO_DIR"] = os.path.abspath(_hot3d_pkg)
 
     seq_folder = os.path.join(os.path.abspath(args.hawor_work_root), args.seq_name)
     fake_video_path = os.path.join(os.path.abspath(args.hawor_work_root), f"{args.seq_name}.mp4")
@@ -202,8 +251,23 @@ def main():
             args.stream_id,
             args.hot3d_module_path,
             overwrite=args.overwrite_prepare,
+            max_frames=args.max_frames,
         )
     _write_vrs_meta_from_prepare(seq_folder)
+
+    # Defer importing eval_hawor_hot3d (pulls YOLO/ultralytics) until after clip prepare so a missing
+    # hand_tracking_toolkit fails fast on the prepare step with a clear stack trace.
+    ev = _load_eval_hot3d_module()
+    load_gt_frame_map = ev.load_gt_frame_map
+    compute_metrics = ev.compute_metrics
+    align_se3_traj = ev.align_se3_traj
+    HOT3D_TO_MANO = ev.HOT3D_TO_MANO
+    from hawor.utils.process import get_mano_faces, run_mano, run_mano_left
+
+    # Import heavy deps here (after prepare, before detect/SLAM) so failures are not surprises
+    # after a long GPU run. Skip paths avoid unused imports (e.g. no ultralytics if --skip-inference).
+    if not args.skip_inference:
+        from lib.pipeline.tools import detect_track
 
     with open(os.path.join(seq_folder, "est_focal.txt")) as f:
         focal = float(f.read().strip())
@@ -374,75 +438,69 @@ def main():
     print(f"Wrote {out_json}")
 
     if args.export_video:
-        R_w2c_sla_all, t_w2c_sla_all, R_c2w_sla_all, t_c2w_sla_all = load_slam_cam(slam_npz)
-        faces = get_mano_faces()
-        faces_new = np.array(
-            [
-                [92, 38, 234],
-                [234, 38, 239],
-                [38, 122, 239],
-                [239, 122, 279],
-                [122, 118, 279],
-                [279, 118, 215],
-                [118, 117, 215],
-                [215, 117, 214],
-                [117, 119, 214],
-                [214, 119, 121],
-                [119, 120, 121],
-                [121, 120, 78],
-                [120, 108, 78],
-                [78, 108, 79],
-            ]
-        )
-        faces_right = np.concatenate([faces, faces_new], axis=0)
-        faces_left = faces_right[:, [0, 2, 1]]
-        T_vis = min(n_frames, pred_trans.shape[1], len(R_w2c_sla_all))
+        T_vis = min(int(n_frames), int(pred_trans.shape[1]))
         vis_start, vis_end = 0, T_vis
-        pred_glob_r = run_mano(
-            pred_trans[1:2, vis_start:vis_end],
-            pred_rot[1:2, vis_start:vis_end],
-            pred_hand_pose[1:2, vis_start:vis_end],
-            betas=pred_betas[1:2, vis_start:vis_end],
-            use_cuda=use_cuda,
-        )
-        pred_glob_l = run_mano_left(
-            pred_trans[0:1, vis_start:vis_end],
-            pred_rot[0:1, vis_start:vis_end],
-            pred_hand_pose[0:1, vis_start:vis_end],
-            betas=pred_betas[0:1, vis_start:vis_end],
-            use_cuda=use_cuda,
-        )
-        right_dict = {"vertices": pred_glob_r["vertices"][0].unsqueeze(0), "faces": faces_right}
-        left_dict = {"vertices": pred_glob_l["vertices"][0].unsqueeze(0), "faces": faces_left}
-        R_x = torch.tensor([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=torch.float32)
-        R_c2w = torch.einsum("ij,njk->nik", R_x, R_c2w_sla_all[vis_start:vis_end])
-        t_c2w = torch.einsum("ij,nj->ni", R_x, t_c2w_sla_all[vis_start:vis_end])
-        R_w2c = R_c2w.transpose(-1, -2)
-        t_w2c = -torch.einsum("bij,bj->bi", R_w2c, t_c2w)
-        left_dict["vertices"] = torch.einsum("ij,btnj->btni", R_x, left_dict["vertices"].cpu())
-        right_dict["vertices"] = torch.einsum("ij,btnj->btni", R_x, right_dict["vertices"].cpu())
-
-        output_pth = os.path.join(args.out_dir, f"vis_cam_{vis_start}_{vis_end}")
-        os.makedirs(output_pth, exist_ok=True)
         image_names = imgfiles[vis_start:vis_end]
-        vid = run_vis2_on_video_cam(
-            left_dict,
-            right_dict,
-            output_pth,
-            focal,
-            image_names,
-            R_w2c=R_w2c,
-            t_w2c=t_w2c,
-            interactive=bool(args.vis_interactive),
-        )
-        if vid:
+
+        if args.export_video_renderer == "cv2":
             dst_mp4 = os.path.join(args.out_dir, f"{args.seq_name}_hawor_cam.mp4")
-            if os.path.isfile(dst_mp4):
-                os.remove(dst_mp4)
-            os.replace(vid, dst_mp4)
-            print(f"Wrote {dst_mp4}")
+            _write_pinhole_frames_mp4(image_names, dst_mp4, fps=float(args.export_video_fps))
+            print(f"Wrote {dst_mp4} (pinhole frames, OpenCV mux; no mesh overlay)")
         else:
-            print("Interactive vis finished (no mp4 path returned).")
+            from lib.eval_utils.custom_utils import load_slam_cam
+            from lib.vis.hawor_mesh_overlay import export_mesh_overlay_video_ffmpeg
+
+            _, _, R_c2w_sla_all, t_c2w_sla_all = load_slam_cam(slam_npz)
+            n_cam = int(R_c2w_sla_all.shape[0])
+            T_vis = min(T_vis, n_cam)
+            vis_start, vis_end = 0, T_vis
+            image_names = imgfiles[vis_start:vis_end]
+
+            faces = get_mano_faces()
+            faces_new = np.array(
+                [
+                    [92, 38, 234],
+                    [234, 38, 239],
+                    [38, 122, 239],
+                    [239, 122, 279],
+                    [122, 118, 279],
+                    [279, 118, 215],
+                    [118, 117, 215],
+                    [215, 117, 214],
+                    [117, 119, 214],
+                    [214, 119, 121],
+                    [119, 120, 121],
+                    [121, 120, 78],
+                    [120, 108, 78],
+                    [78, 108, 79],
+                ]
+            )
+            faces_right = np.concatenate([faces, faces_new], axis=0)
+
+            R_np = R_c2w_sla_all[vis_start:vis_end].detach().cpu().numpy().astype(np.float32)
+            t_np = t_c2w_sla_all[vis_start:vis_end].detach().cpu().numpy().astype(np.float32)
+            verts_slice = verts_aligned[vis_start:vis_end]
+            pred_slice = pred_valid_np[vis_start:vis_end].astype(bool)
+
+            dst_mp4 = os.path.join(args.out_dir, f"{args.seq_name}_hawor_cam.mp4")
+            work_dir = os.path.join(args.out_dir, f"_mesh_frames_{args.seq_name}")
+            export_mesh_overlay_video_ffmpeg(
+                image_names,
+                verts_slice,
+                pred_slice,
+                R_np,
+                t_np,
+                R_align,
+                t_align,
+                float(focal),
+                faces_right,
+                dst_mp4,
+                fps=float(args.export_video_fps),
+                mesh_alpha=float(args.export_video_mesh_alpha),
+                work_dir=work_dir,
+                keep_frames=bool(args.export_video_keep_frames),
+            )
+            print(f"Wrote {dst_mp4} (pinhole RGB + pyrender MANO, ffmpeg libx264)")
 
 
 if __name__ == "__main__":
