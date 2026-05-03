@@ -129,6 +129,7 @@ def export_mesh_overlay_video_ffmpeg(
     mesh_alpha: float = 0.75,
     work_dir: str | None = None,
     keep_frames: bool = False,
+    cam_K: np.ndarray | None = None,
 ) -> None:
     if not image_paths:
         raise ValueError("no frames")
@@ -148,8 +149,11 @@ def export_mesh_overlay_video_ffmpeg(
     if first is None:
         raise RuntimeError(f"cv2.imread failed: {image_paths[0]}")
     h, w = first.shape[:2]
-    cx, cy = w * 0.5, h * 0.5
-    K = np.array([[fx, 0.0, cx], [0.0, fx, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
+    if cam_K is not None:
+        K = np.asarray(cam_K, dtype=np.float32).reshape(3, 3)
+    else:
+        cx, cy = w * 0.5, h * 0.5
+        K = np.array([[fx, 0.0, cx], [0.0, fx, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
 
     if work_dir is None:
         work_dir = os.path.join(os.path.dirname(os.path.abspath(out_mp4)), "_frames_mesh_overlay_tmp")
